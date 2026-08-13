@@ -1,10 +1,18 @@
 """Linear-beta DDPM: forward noising, training loss, and ancestral sampling.
 
 This is the reusable twin of the inline cells in train.ipynb — keep them in sync.
+
+Works with either model: pass `y=None` for the unconditional UNet, or class
+indices for ConditionedUNet.
 """
 
 import torch
 import torch.nn.functional as F
+
+
+def _eps(model, x, t, y):
+    """Call the model, conditionally, so both UNet variants fit one code path."""
+    return model(x, t) if y is None else model(x, t, y)
 
 
 class Diffusion:
@@ -23,18 +31,21 @@ class Diffusion:
         acp = self.alphas_cumprod[t].view(-1, 1, 1, 1)
         return acp.sqrt() * x0 + (1 - acp).sqrt() * noise
 
-    def loss(self, model, x0):
+    def loss(self, model, x0, y=None):
         """MSE between the noise we added and the noise the model predicts."""
         t = torch.randint(0, self.timesteps, (x0.shape[0],), device=x0.device)
         noise = torch.randn_like(x0)
-        return F.mse_loss(model(self.q_sample(x0, t, noise), t), noise)
+        return F.mse_loss(_eps(model, self.q_sample(x0, t, noise), t, y), noise)
 
     @torch.no_grad()
-    def sample(self, model, n=1, shape=(3, 64, 64), start_t=None, x0=None):
+    def sample(self, model, n=1, shape=(3, 64, 64), start_t=None, x0=None, y=None):
         """Reverse diffusion from `start_t` down to 0.
 
         With `x0=None` it starts from pure noise. Pass `x0` to instead noise a
         real image up to `start_t` and denoise from there (`n` is then ignored).
+
+        `y` is the class to draw: an int for "all of this class", or a tensor of
+        one index per image.
         """
         start_t = start_t or self.timesteps
 
@@ -44,9 +55,15 @@ class Diffusion:
             t = torch.full((x0.shape[0],), start_t - 1, device=self.device)
             x = self.q_sample(x0, t, torch.randn_like(x0))
 
+        if y is not None:
+            if isinstance(y, int):
+                y = torch.full((x.shape[0],), y, device=self.device)
+            else:
+                y = y.to(self.device)
+
         for i in reversed(range(start_t)):
             t = torch.full((x.shape[0],), i, device=self.device)
-            eps = model(x, t)
+            eps = _eps(model, x, t, y)
 
             mean = (
                 x - self.betas[i] / (1 - self.alphas_cumprod[i]).sqrt() * eps
