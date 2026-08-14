@@ -7,9 +7,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-# Placeholders until the real (labelled) dataset lands — repoint both then.
+# The original unconditional run trained on this one.
 IMAGES_DIR = "datasets/valhalla_emoji/images"
-METADATA_CSV = "datasets/valhalla_emoji/metadata.csv"
+
+# Curated openmoji subsets for the conditional runs — see make_subsets.py.
+OPENMOJI_10 = "datasets/openmoji_10"
+OPENMOJI_200 = "datasets/openmoji_200"
 
 
 def default_transform():
@@ -45,12 +48,19 @@ class ConditionedEmojiDataset(Dataset):
     arguments: point them at whatever the new dataset calls them.
     """
 
+    @classmethod
+    def from_dir(cls, root=OPENMOJI_200, **kwargs):
+        """Load a dataset laid out as <root>/images + <root>/metadata.csv."""
+        root = Path(root)
+        return cls(root / "images", root / "metadata.csv", **kwargs)
+
     def __init__(
         self,
-        root=IMAGES_DIR,
-        csv_path=METADATA_CSV,
+        root=f"{OPENMOJI_200}/images",
+        csv_path=f"{OPENMOJI_200}/metadata.csv",
         filename_col="filename",
         label_col="group",
+        classes=None,
         transform=None,
     ):
         self.paths = sorted(Path(root).glob("*.png"))
@@ -69,17 +79,28 @@ class ConditionedEmojiDataset(Dataset):
                 f"available: {sorted(rows[0])}"
             )
 
-        labels_by_file = {row[filename_col]: row[label_col] for row in rows}
+        rows_by_file = {row[filename_col]: row for row in rows}
 
-        unlabelled = [p.name for p in self.paths if p.name not in labels_by_file]
+        unlabelled = [p.name for p in self.paths if p.name not in rows_by_file]
         if unlabelled:
             raise ValueError(
                 f"{len(unlabelled)} image(s) have no row in {csv_path}, e.g. "
                 f"{unlabelled[:5]}"
             )
 
-        names = [labels_by_file[p.name] for p in self.paths]
-        self.classes = sorted(set(names))
+        # The full CSV row per image, aligned with self.paths: the notebook uses
+        # `name` for CLIP prompts and for labelling samples.
+        self.meta = [rows_by_file[p.name] for p in self.paths]
+        names = [row[label_col] for row in self.meta]
+
+        # `classes` pins the label space. Two subsets of the same dataset would
+        # otherwise disagree on what index 0 means, which silently invalidates
+        # any comparison between models trained on them.
+        self.classes = sorted(set(names)) if classes is None else list(classes)
+        unknown = sorted(set(names) - set(self.classes))
+        if unknown:
+            raise ValueError(f"labels not in the given `classes`: {unknown}")
+
         self.class_to_idx = {name: i for i, name in enumerate(self.classes)}
         self.num_classes = len(self.classes)
         self.labels = [self.class_to_idx[name] for name in names]
@@ -107,10 +128,12 @@ if __name__ == "__main__":
     print(f"batch:  {batch.shape} {batch.dtype}")
     print(f"range:  [{batch.min():.2f}, {batch.max():.2f}]")
 
-    cond = ConditionedEmojiDataset()
-    cond_loader = DataLoader(cond, batch_size=8, shuffle=True)
+    for subset in (OPENMOJI_10, OPENMOJI_200):
+        cond = ConditionedEmojiDataset.from_dir(subset)
+        images, labels = next(iter(DataLoader(cond, batch_size=8, shuffle=True)))
 
-    images, labels = next(iter(cond_loader))
-    print(f"\nclasses ({cond.num_classes}): {cond.classes}")
-    print(f"images: {images.shape} {images.dtype}")
-    print(f"labels: {labels.shape} {labels.dtype} -> {labels.tolist()}")
+        print(f"\n{subset}: {len(cond)} images, {cond.num_classes} classes")
+        print(f"classes: {cond.classes}")
+        print(f"images:  {images.shape} {images.dtype}")
+        print(f"labels:  {labels.shape} {labels.dtype} -> {labels.tolist()}")
+        print(f"example: {cond.meta[0]['name']!r} -> {cond.classes[cond.labels[0]]}")

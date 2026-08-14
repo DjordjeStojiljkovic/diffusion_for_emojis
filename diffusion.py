@@ -10,9 +10,34 @@ import torch
 import torch.nn.functional as F
 
 
-def _eps(model, x, t, y):
-    """Call the model, conditionally, so both UNet variants fit one code path."""
-    return model(x, t) if y is None else model(x, t, y)
+def _eps(model, x, t, y, guidance_scale=1.0):
+    """Predict the noise, optionally with classifier-free guidance.
+
+    Guidance extrapolates away from the unconditional prediction:
+    eps = eps_uncond + s * (eps_cond - eps_uncond). s=1 is plain conditional,
+    s>1 trades diversity for a stronger class signal. Both predictions go
+    through the model in one batched call.
+    """
+    if y is None:
+        return model(x, t)
+    if guidance_scale == 1.0:
+        return model(x, t, y)
+
+    null = torch.full_like(y, model.null_class)
+    both = model(
+        torch.cat([x, x]), torch.cat([t, t]), torch.cat([y, null])
+    )
+    eps_cond, eps_uncond = both.chunk(2)
+    return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+
+def _as_labels(y, n, device):
+    """Accept an int class ("all of this class") or a per-image tensor."""
+    if y is None:
+        return None
+    if isinstance(y, int):
+        return torch.full((n,), y, device=device, dtype=torch.long)
+    return y.to(device)
 
 
 class Diffusion:
@@ -38,7 +63,10 @@ class Diffusion:
         return F.mse_loss(_eps(model, self.q_sample(x0, t, noise), t, y), noise)
 
     @torch.no_grad()
-    def sample(self, model, n=1, shape=(3, 64, 64), start_t=None, x0=None, y=None):
+    def sample(
+        self, model, n=1, shape=(3, 64, 64), start_t=None, x0=None, y=None,
+        guidance_scale=1.0,
+    ):
         """Reverse diffusion from `start_t` down to 0.
 
         With `x0=None` it starts from pure noise. Pass `x0` to instead noise a
@@ -55,15 +83,11 @@ class Diffusion:
             t = torch.full((x0.shape[0],), start_t - 1, device=self.device)
             x = self.q_sample(x0, t, torch.randn_like(x0))
 
-        if y is not None:
-            if isinstance(y, int):
-                y = torch.full((x.shape[0],), y, device=self.device)
-            else:
-                y = y.to(self.device)
+        y = _as_labels(y, x.shape[0], self.device)
 
         for i in reversed(range(start_t)):
             t = torch.full((x.shape[0],), i, device=self.device)
-            eps = _eps(model, x, t, y)
+            eps = _eps(model, x, t, y, guidance_scale)
 
             mean = (
                 x - self.betas[i] / (1 - self.alphas_cumprod[i]).sqrt() * eps
@@ -74,5 +98,51 @@ class Diffusion:
                 x = mean + self.betas[i].sqrt() * torch.randn_like(x)
             else:
                 x = mean
+
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(
+        self, model, n=1, shape=(3, 64, 64), steps=100, eta=0.0, y=None,
+        guidance_scale=1.0,
+    ):
+        """Deterministic (eta=0) DDIM sampling on a strided subsequence.
+
+        Same trained model, ~10x fewer network calls than `sample`. Used for
+        previews during training and for the metric batches, where hundreds of
+        images at 1000 ancestral steps each would dominate the runtime.
+        """
+        # Descending subsequence of timesteps, e.g. 999, 989, ..., 0.
+        ts = torch.linspace(self.timesteps - 1, 0, steps).round().long().tolist()
+
+        x = torch.randn(n, *shape, device=self.device)
+        y = _as_labels(y, n, self.device)
+
+        for i, t_cur in enumerate(ts):
+            t = torch.full((n,), t_cur, device=self.device)
+            eps = _eps(model, x, t, y, guidance_scale)
+
+            acp = self.alphas_cumprod[t_cur]
+            # alphas_cumprod at the *next* (earlier) step; 1.0 past the end.
+            acp_prev = (
+                self.alphas_cumprod[ts[i + 1]]
+                if i + 1 < len(ts)
+                else torch.ones((), device=self.device)
+            )
+
+            # The clean image implied by the current noise prediction.
+            x0_hat = ((x - (1 - acp).sqrt() * eps) / acp.sqrt()).clamp(-1, 1)
+
+            # eta=0 makes this deterministic; eta=1 recovers DDPM-like noise.
+            sigma = (
+                eta
+                * ((1 - acp_prev) / (1 - acp)).sqrt()
+                * (1 - acp / acp_prev).clamp(min=0).sqrt()
+            )
+            direction = (1 - acp_prev - sigma**2).clamp(min=0).sqrt() * eps
+
+            x = acp_prev.sqrt() * x0_hat + direction
+            if eta > 0 and i + 1 < len(ts):
+                x = x + sigma * torch.randn_like(x)
 
         return x
