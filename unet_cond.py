@@ -29,6 +29,10 @@ class ConditionedUNet(UNet):
         time_dim = self.time_mlp[-1].out_features
         self.label_emb = nn.Embedding(num_classes + 1, time_dim)
 
+    def null_like(self, y):
+        """The unconditional counterpart of `y`, for classifier-free guidance."""
+        return torch.full_like(y, self.null_class)
+
     def maybe_drop(self, y):
         """Replace some labels with the null class, but only while training."""
         if not self.training or self.label_dropout <= 0:

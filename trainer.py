@@ -90,12 +90,17 @@ def train(
     checkpoint_every=2_000,
     preview_every=2_000,
     preview_per_class=4,
+    preview_labels=None,
     preview_ddim_steps=100,
     guidance_scale=1.0,
     num_workers=2,
     device="cpu",
     seed=0,
     on_preview=None,
+    ema=None,
+    start_step=0,
+    optimizer_state=None,
+    losses=None,
 ):
     """Train `model` on `dataset` and return (model, ema, losses, diffusion).
 
@@ -106,8 +111,14 @@ def train(
     weights are written to runs/<name>/ckpt.pt every `checkpoint_every` steps as
     well as at the end, and interrupting with Ctrl-C exits cleanly and keeps
     everything logged so far.
+
+    `steps` is always how many steps *this call* runs. To continue an earlier
+    run, pass its `ema`, its `start_step`, its `optimizer_state` and its
+    `losses`, and the logs, loss history and step numbering carry on rather than
+    restarting at zero.
     """
-    torch.manual_seed(seed)
+    # Offset by start_step so a resumed run does not replay the same batches.
+    torch.manual_seed(seed + start_step)
 
     loader = DataLoader(
         dataset,
@@ -124,16 +135,22 @@ def train(
     steps_per_epoch = max(1, len(loader))
 
     model = model.to(device)
-    ema = make_ema(model)
+    ema = (make_ema(model) if ema is None else ema).to(device)
+
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    if optimizer_state is not None:
+        opt.load_state_dict(optimizer_state)
+
     diffusion = Diffusion(timesteps=timesteps, device=device)
 
-    losses, window = [], []
-    step = 0
+    losses = list(losses) if losses is not None else []
+    window = []
+    step = start_step
+    target = start_step + steps
     started = time.time()
 
     try:
-        while step < steps:
+        while step < target:
             for images, labels in loader:
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -161,8 +178,13 @@ def train(
                     run.save_checkpoint(model, ema=ema, step=step)
 
                 if preview_every and step % preview_every == 0:
-                    labels_preview = class_labels(
-                        model.num_classes, preview_per_class, device
+                    # With hundreds of classes (one per emoji name) a preview of
+                    # every class is thousands of images, so callers pass an
+                    # explicit handful instead.
+                    labels_preview = (
+                        class_labels(model.num_classes, preview_per_class, device)
+                        if preview_labels is None
+                        else preview_labels.to(device)
                     )
                     images_preview = generate(
                         ema, diffusion, labels_preview,
@@ -177,20 +199,23 @@ def train(
                     if on_preview is not None:
                         on_preview(step, images_preview, labels_preview.cpu())
 
-                if step >= steps:
+                if step >= target:
                     break
     except KeyboardInterrupt:
         print(f"interrupted at step {step}")
 
     minutes = (time.time() - started) / 60
-    print(f"done: {step} steps in {minutes:.1f} min, final loss {losses[-1]:.4f}")
+    ran = step - start_step
+    print(f"done: {ran} steps in {minutes:.1f} min (now at {step}), final loss {losses[-1]:.4f}")
 
     if run is not None:
         run.save_losses(losses)
-        print(f"saved weights -> {run.save_checkpoint(model, ema=ema, step=step)}")
+        # The rolling checkpoint carries the optimiser so training can resume.
+        print(f"saved weights -> {run.save_checkpoint(model, ema=ema, step=step, opt=opt)}")
         run.save_config(
             steps_completed=step,
-            train_minutes=round(minutes, 2),
+            train_minutes=round(run.config.get("train_minutes", 0.0) + minutes, 2),
+            last_round_minutes=round(minutes, 2),
             final_loss=losses[-1],
             steps_per_epoch=steps_per_epoch,
         )
@@ -227,5 +252,24 @@ if __name__ == "__main__":
         assert len(losses) == 3
         assert (run.samples_dir / "preview_000003.png").exists()
         assert run.read_json("config.json")["steps_completed"] == 3
+
+        # Resume: two more steps continue the numbering and the loss history.
+        checkpoint = run.load_checkpoint()
+        assert "opt" in checkpoint, "the rolling checkpoint must carry the optimiser"
+
+        print()
+        model, ema, losses, _ = train(
+            model, dataset, run,
+            steps=2, batch_size=4, timesteps=20, log_every=1,
+            checkpoint_every=0, preview_every=0, num_workers=0,
+            ema=ema, start_step=checkpoint["step"],
+            optimizer_state=checkpoint["opt"], losses=run.load_losses(),
+        )
+        assert len(losses) == 5, f"history should extend to 5, got {len(losses)}"
+        assert run.read_json("config.json")["steps_completed"] == 5
+        assert run.load_checkpoint()["step"] == 5
+        # The merged config must not have dropped what the first round wrote.
+        assert run.read_json("config.json")["dataset"] == OPENMOJI_10
+
         print("\nfiles:", sorted(p.name for p in run.dir.rglob("*")))
         print("ok")

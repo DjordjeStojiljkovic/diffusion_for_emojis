@@ -23,7 +23,13 @@ def _eps(model, x, t, y, guidance_scale=1.0):
     if guidance_scale == 1.0:
         return model(x, t, y)
 
-    null = torch.full_like(y, model.null_class)
+    # Each conditional model defines its own "unconditional" — a null class
+    # index, or the embedding of the empty prompt for the text-conditioned one.
+    null = (
+        model.null_like(y)
+        if hasattr(model, "null_like")
+        else torch.full_like(y, model.null_class)
+    )
     both = model(
         torch.cat([x, x]), torch.cat([t, t]), torch.cat([y, null])
     )

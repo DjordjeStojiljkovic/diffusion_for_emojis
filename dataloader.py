@@ -13,6 +13,7 @@ IMAGES_DIR = "datasets/valhalla_emoji/images"
 # Curated openmoji subsets for the conditional runs — see make_subsets.py.
 OPENMOJI_10 = "datasets/openmoji_10"
 OPENMOJI_200 = "datasets/openmoji_200"
+OPENMOJI_500 = "datasets/openmoji_500"
 
 
 def default_transform():

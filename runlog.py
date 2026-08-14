@@ -147,7 +147,14 @@ class Run:
         self.samples_dir = self.dir / "samples"
         self.samples_dir.mkdir(parents=True, exist_ok=True)
 
-        self.config = dict(config or {})
+        # Merge rather than replace: re-running the cell that constructs a Run
+        # must not erase what training recorded afterwards (steps_completed,
+        # wall-clock, final loss), and a resumed run needs its history intact.
+        existing = {}
+        if self.path("config.json").exists():
+            existing = self.read_json("config.json")
+
+        self.config = {**existing, **(config or {})}
         if self.config:
             self.save_config()
 
@@ -178,6 +185,17 @@ class Run:
             writer.writerows(enumerate(losses, start=1))
         return self.path("losses.csv")
 
+    def load_losses(self):
+        """The loss history so far, so a resumed run extends it instead of
+        overwriting it with only the new steps."""
+        path = self.path("losses.csv")
+        if not path.exists():
+            return []
+
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        return [float(loss) for _, loss in rows[1:]]
+
     def save_loss_curve(self, losses, k=100):
         plot_losses(losses, k, title=f"{self.name} — training loss", path=self.path("loss.png"))
         return self.path("loss.png")
@@ -187,16 +205,22 @@ class Run:
         make_grid(images, ncols).save(path)
         return path
 
-    def save_checkpoint(self, model, ema=None, step=None, filename="ckpt.pt", **extra):
+    def save_checkpoint(self, model, ema=None, step=None, filename="ckpt.pt", opt=None, **extra):
         """Write model + EMA weights, replacing the previous checkpoint.
 
         Saved through a temporary file: mid-training checkpoints overwrite the
         only copy, and a crash during a 120 MB write would otherwise leave a
         truncated file where the last good one used to be.
+
+        Pass `opt` to include the optimiser state, which roughly doubles the
+        file but lets training resume without Adam's moments restarting from
+        zero. Archival snapshots normally omit it.
         """
         payload = {"model": model.state_dict(), "step": step, **extra}
         if ema is not None:
             payload["ema"] = ema.state_dict()
+        if opt is not None:
+            payload["opt"] = opt.state_dict()
 
         path = self.path(filename)
         tmp = path.with_suffix(path.suffix + ".tmp")

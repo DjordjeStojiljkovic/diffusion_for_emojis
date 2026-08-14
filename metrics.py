@@ -74,6 +74,10 @@ class ClipFeatures:
         import open_clip
 
         self.device = device
+        # Kept so a cached artifact can record which encoder produced it.
+        self.model_name = model_name
+        self.pretrained = pretrained
+
         self.model = open_clip.create_model(model_name, pretrained=pretrained)
         self.model.eval().to(device)
         self.tokenizer = open_clip.get_tokenizer(model_name)
@@ -130,7 +134,9 @@ def kid(real, fake, subsets=100, subset_size=None, generator=None):
     samples. Returns (mean, std) over random subsets.
     """
     n = min(len(real), len(fake))
-    subset_size = min(subset_size or n, n)
+    # Subsets must be smaller than the full set, or every "random subset" is the
+    # same set reordered and the reported std is a meaningless 0.
+    subset_size = min(subset_size or max(2, min(1000, n // 2)), n)
     if subset_size < 2:
         raise ValueError("need at least 2 samples per subset")
 
@@ -332,7 +338,9 @@ if __name__ == "__main__":
     shifted = torch.randn(256, 64) + 2.0
 
     print(f"fid  same: {fid(a, b):8.3f}   shifted: {fid(a, shifted):8.3f}")
-    print(f"kid  same: {kid(a, b)[0]:8.4f}   shifted: {kid(a, shifted)[0]:8.4f}")
+    kid_same, kid_std = kid(a, b)
+    print(f"kid  same: {kid_same:8.4f}   shifted: {kid(a, shifted)[0]:8.4f}   (std {kid_std:.4f})")
+    assert kid_std > 0, "subsets must differ, or the std is meaningless"
     print(f"cmmd same: {cmmd(a, b):8.4f}   shifted: {cmmd(a, shifted):8.4f}")
     print("p/r  same: {:.2f}/{:.2f}   shifted: {:.2f}/{:.2f}".format(
         *precision_recall(a, b), *precision_recall(a, shifted)
