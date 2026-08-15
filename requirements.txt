@@ -1,0 +1,21 @@
+# Training and data
+torch>=2.0            # scaled_dot_product_attention in unet.py
+torchvision           # dataset transforms; InceptionV3 features for FID/KID
+pillow
+numpy
+matplotlib
+
+# CLIP: metrics AND the text conditioning bank (metrics.py imports it lazily)
+open_clip_torch       # CLIP score, zero-shot accuracy, CMMD, emoji_text.py's name bank
+
+# Prompt -> emoji-name decomposition (emoji_llm.py, imported lazily)
+huggingface_hub       # download_llm.py only needs this
+transformers          # only needed to *run* the downloaded LLM
+
+# Notebooks
+jupyterlab
+ipykernel
+
+# Deliberately NOT required:
+#   scipy   — FID's matrix square root uses torch.linalg.eigh instead
+#   pandas  — make_subsets.py uses the csv module

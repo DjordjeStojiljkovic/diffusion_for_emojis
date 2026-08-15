@@ -35,41 +35,112 @@ def make_ema(model):
 def generate(
     model,
     diffusion,
-    labels,
+    labels=None,
     shape=(3, 64, 64),
     guidance_scale=1.0,
     ddim_steps=100,
     batch_size=64,
     device=None,
+    n=None,
 ):
     """Generate one image per entry of `labels`, in batches.
+
+    Pass `labels=None` with `n=` for an unconditional model, which has no class
+    to be told about.
 
     `ddim_steps=None` falls back to full ancestral sampling — better quality,
     ~10x slower. DDIM is the default because the metric batches need hundreds
     of images.
     """
     device = device or diffusion.device
-    labels = labels.to(device)
+    if labels is None:
+        if n is None:
+            raise ValueError("pass `n` when generating without labels")
+    else:
+        labels = labels.to(device)
+        n = len(labels)
 
     was_training = model.training
     model.eval()
 
     out = []
-    for i in range(0, len(labels), batch_size):
-        chunk = labels[i : i + batch_size]
+    for i in range(0, n, batch_size):
+        count = min(batch_size, n - i)
+        chunk = None if labels is None else labels[i : i + count]
         if ddim_steps:
             images = diffusion.ddim_sample(
-                model, n=len(chunk), shape=shape, steps=ddim_steps,
+                model, n=count, shape=shape, steps=ddim_steps,
                 y=chunk, guidance_scale=guidance_scale,
             )
         else:
             images = diffusion.sample(
-                model, n=len(chunk), shape=shape, y=chunk, guidance_scale=guidance_scale,
+                model, n=count, shape=shape, y=chunk, guidance_scale=guidance_scale,
             )
         out.append(images.cpu())
 
     model.train(was_training)
     return torch.cat(out)
+
+
+def unpack(batch):
+    """(images, labels) from a loader batch, with labels None when unlabelled.
+
+    EmojiDataset yields bare tensors and ConditionedEmojiDataset yields pairs,
+    so the training loop has to accept either.
+    """
+    if isinstance(batch, (list, tuple)):
+        return batch[0], batch[1]
+    return batch, None
+
+
+def fixed_val_batch(dataset, max_images=512, seed=1234, timesteps=1000, unconditional=False):
+    """Materialise the validation set with one *fixed* (t, noise) draw per image.
+
+    The diffusion loss is an expectation over timesteps and noise. Re-drawing
+    them at every evaluation swamps the real signal: consecutive validation
+    losses would differ mostly by which timesteps happened to come up. Freezing
+    them turns the val curve into something you can actually read a trend off,
+    at the cost of it being an estimate over one fixed draw rather than the full
+    expectation — fine, since we only ever compare it against itself.
+
+    Capped at `max_images` because this runs every `val_every` steps.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    count = min(max_images, len(dataset))
+    indices = torch.randperm(len(dataset), generator=generator)[:count]
+
+    rows = [unpack(dataset[int(i)]) for i in indices]
+    images = torch.stack([image for image, _ in rows])
+    labels = None
+    if not unconditional and rows[0][1] is not None:
+        labels = torch.tensor([label for _, label in rows], dtype=torch.long)
+
+    t = torch.randint(0, timesteps, (count,), generator=generator)
+    noise = torch.randn(images.shape, generator=generator)
+    return images, labels, t, noise
+
+
+@torch.no_grad()
+def evaluate_loss(model, diffusion, batch, batch_size=64, device="cpu"):
+    """Mean diffusion loss over a `fixed_val_batch`, in eval mode."""
+    images, labels, t, noise = batch
+    was_training = model.training
+    model.eval()
+
+    total = 0.0
+    for i in range(0, len(images), batch_size):
+        chunk = slice(i, i + batch_size)
+        loss = diffusion.loss(
+            model,
+            images[chunk].to(device),
+            None if labels is None else labels[chunk].to(device),
+            t=t[chunk].to(device),
+            noise=noise[chunk].to(device),
+        )
+        total += float(loss) * len(images[chunk])
+
+    model.train(was_training)
+    return total / len(images)
 
 
 def class_labels(num_classes, per_class, device="cpu"):
@@ -81,15 +152,20 @@ def train(
     model,
     dataset,
     run=None,
+    val_dataset=None,
     steps=20_000,
     batch_size=32,
     lr=2e-4,
     timesteps=1000,
     ema_decay=0.999,
     log_every=250,
+    val_every=None,
+    val_max_images=512,
+    val_seed=1234,
     checkpoint_every=2_000,
     preview_every=2_000,
     preview_per_class=4,
+    preview_n=8,
     preview_labels=None,
     preview_ddim_steps=100,
     guidance_scale=1.0,
@@ -101,11 +177,23 @@ def train(
     start_step=0,
     optimizer_state=None,
     losses=None,
+    val_losses=None,
+    unconditional=False,
 ):
     """Train `model` on `dataset` and return (model, ema, losses, diffusion).
 
     The EMA copy is what gets sampled from and evaluated; the raw weights are
     kept too so the two can be compared.
+
+    Pass `val_dataset` (see dataloader.train_val_split) to log a validation loss
+    every `val_every` steps alongside the training loss. It is measured on the
+    *raw* weights, not the EMA copy, so it is directly comparable to the
+    training loss it is plotted against — a gap opening between the two is the
+    overfitting signal.
+
+    `unconditional=True` trains the plain UNet, ignoring any labels the dataset
+    yields. That lets an unconditional run reuse a labelled dataset purely for
+    its train/val split machinery.
 
     Losing a multi-hour run to a dead kernel is the expensive failure here, so
     weights are written to runs/<name>/ckpt.pt every `checkpoint_every` steps as
@@ -144,16 +232,31 @@ def train(
     diffusion = Diffusion(timesteps=timesteps, device=device)
 
     losses = list(losses) if losses is not None else []
+    val_losses = dict(val_losses) if val_losses is not None else {}
+    val_every = val_every or log_every
+    val_batch = None
+    if val_dataset is not None:
+        val_batch = fixed_val_batch(
+            val_dataset, val_max_images, val_seed, timesteps, unconditional
+        )
+        print(f"validation: {len(val_batch[0])} of {len(val_dataset)} images, "
+              f"fixed noise, every {val_every} steps")
+
     window = []
+    pending = []
     step = start_step
     target = start_step + steps
     started = time.time()
 
     try:
         while step < target:
-            for images, labels in loader:
+            for batch in loader:
+                images, labels = unpack(batch)
                 images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+                if labels is not None:
+                    labels = labels.to(device, non_blocking=True)
+                if unconditional:
+                    labels = None
 
                 loss = diffusion.loss(model, images, labels)
 
@@ -166,13 +269,27 @@ def train(
                 losses.append(loss.item())
                 window.append(loss.item())
 
+                val_loss = None
+                if val_batch is not None and step % val_every == 0:
+                    val_loss = evaluate_loss(model, diffusion, val_batch, device=device)
+                    val_losses[step] = val_loss
+                pending.append((step, loss.item(), val_loss))
+
                 if step % log_every == 0:
+                    val_note = f" | val {val_losses[step]:.4f}" if step in val_losses else ""
                     print(
                         f"step {step:6d} | epoch {step / steps_per_epoch:7.1f}"
-                        f" | loss {sum(window) / len(window):.4f}"
+                        f" | loss {sum(window) / len(window):.4f}{val_note}"
                         f" | {(time.time() - started) / 60:5.1f} min"
                     )
                     window.clear()
+
+                    # Flush to disk as we go: the loss history used to be
+                    # written only at the end, so a dead kernel lost hours of it
+                    # even though the checkpoints had survived.
+                    if run is not None and pending:
+                        run.append_losses(pending)
+                        pending.clear()
 
                 if run is not None and checkpoint_every and step % checkpoint_every == 0:
                     run.save_checkpoint(model, ema=ema, step=step)
@@ -181,15 +298,20 @@ def train(
                     # With hundreds of classes (one per emoji name) a preview of
                     # every class is thousands of images, so callers pass an
                     # explicit handful instead.
-                    labels_preview = (
-                        class_labels(model.num_classes, preview_per_class, device)
-                        if preview_labels is None
-                        else preview_labels.to(device)
-                    )
+                    if unconditional:
+                        labels_preview = None
+                    elif preview_labels is None:
+                        labels_preview = class_labels(
+                            model.num_classes, preview_per_class, device
+                        )
+                    else:
+                        labels_preview = preview_labels.to(device)
+
                     images_preview = generate(
                         ema, diffusion, labels_preview,
                         guidance_scale=guidance_scale,
                         ddim_steps=preview_ddim_steps, device=device,
+                        n=preview_n,
                     )
                     if run is not None:
                         run.save_grid(
@@ -197,7 +319,10 @@ def train(
                             ncols=preview_per_class,
                         )
                     if on_preview is not None:
-                        on_preview(step, images_preview, labels_preview.cpu())
+                        on_preview(
+                            step, images_preview,
+                            None if labels_preview is None else labels_preview.cpu(),
+                        )
 
                 if step >= target:
                     break
@@ -209,7 +334,8 @@ def train(
     print(f"done: {ran} steps in {minutes:.1f} min (now at {step}), final loss {losses[-1]:.4f}")
 
     if run is not None:
-        run.save_losses(losses)
+        # Rewrites the file, superseding the incremental appends above.
+        run.save_losses(losses, val_losses)
         # The rolling checkpoint carries the optimiser so training can resume.
         print(f"saved weights -> {run.save_checkpoint(model, ema=ema, step=step, opt=opt)}")
         run.save_config(
@@ -218,8 +344,13 @@ def train(
             last_round_minutes=round(minutes, 2),
             final_loss=losses[-1],
             steps_per_epoch=steps_per_epoch,
+            **({"final_val_loss": val_losses[max(val_losses)],
+                "val_every": val_every,
+                "n_val_images": len(val_batch[0])} if val_losses else {}),
         )
 
+    # val_losses stays out of the return tuple so existing 4-way unpacking in
+    # the notebooks keeps working; read it back with run.load_loss_history().
     return model, ema, losses, diffusion
 
 

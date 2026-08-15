@@ -4,7 +4,7 @@ Everything a run produces lands under runs/<name>/ so results survive the
 notebook kernel and can be pulled straight into a presentation:
 
     runs/<name>/config.json      hyperparameters and dataset description
-    runs/<name>/losses.csv       per-step training loss
+    runs/<name>/losses.csv       per-step training loss + sparse val_loss
     runs/<name>/loss.png         loss curve
     runs/<name>/metrics.json     everything metrics.evaluate returned
     runs/<name>/ckpt.pt          model + EMA weights
@@ -27,6 +27,7 @@ RUNS_DIR = "runs"
 
 RAW_COLOR = "#c9ccd1"
 LINE_COLOR = "#3b6fd4"
+VAL_COLOR = "#d4703b"
 TEXT_COLOR = "#555"
 
 
@@ -120,10 +121,18 @@ def smooth(values, k=25):
     return out
 
 
-def plot_losses(losses, k=100, title=None, path=None):
+def plot_losses(losses, k=100, title=None, path=None, val_losses=None):
     fig, ax = plt.subplots(figsize=(7, 3.2))
-    ax.plot(losses, color=RAW_COLOR, linewidth=0.8)
-    ax.plot(smooth(losses, k), color=LINE_COLOR, linewidth=1.6)
+    ax.plot(losses, color=RAW_COLOR, linewidth=0.8, label="train (raw)")
+    ax.plot(smooth(losses, k), color=LINE_COLOR, linewidth=1.6, label="train")
+    if val_losses:
+        steps = sorted(val_losses)
+        # Validation is evaluated on fixed (t, noise), so it is already smooth
+        # and is plotted unsmoothed — a gap opening against the train curve is
+        # the overfitting signal.
+        ax.plot(steps, [val_losses[s] for s in steps],
+                color=VAL_COLOR, linewidth=1.6, label="validation")
+        ax.legend(frameon=False, fontsize=8, labelcolor=TEXT_COLOR)
     ax.set_yscale("log")
     ax.set_xlabel("step", color=TEXT_COLOR)
     ax.set_ylabel("loss", color=TEXT_COLOR)
@@ -178,26 +187,63 @@ class Run:
         with open(self.path(filename), encoding="utf-8") as f:
             return json.load(f)
 
-    def save_losses(self, losses):
+    LOSS_COLUMNS = ["step", "loss", "val_loss"]
+
+    def save_losses(self, losses, val_losses=None):
+        """Rewrite the whole history. `val_losses` is {step: loss}, sparse.
+
+        Called at the end of training, where it supersedes whatever the
+        incremental appends left behind.
+        """
+        val_losses = val_losses or {}
         with open(self.path("losses.csv"), "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["step", "loss"])
-            writer.writerows(enumerate(losses, start=1))
+            writer.writerow(self.LOSS_COLUMNS)
+            for step, loss in enumerate(losses, start=1):
+                writer.writerow([step, loss, val_losses.get(step, "")])
         return self.path("losses.csv")
 
+    def append_losses(self, rows):
+        """Append (step, loss, val_loss_or_None) rows mid-training.
+
+        Insurance against losing hours of history to a dead kernel: the final
+        save_losses rewrites the file anyway, so a partial append is never the
+        authoritative copy, only the surviving one.
+        """
+        path = self.path("losses.csv")
+        write_header = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(self.LOSS_COLUMNS)
+            for step, loss, val in rows:
+                writer.writerow([step, loss, "" if val is None else val])
+        return path
+
     def load_losses(self):
-        """The loss history so far, so a resumed run extends it instead of
-        overwriting it with only the new steps."""
+        """The training-loss history so far, so a resumed run extends it
+        instead of overwriting it with only the new steps."""
+        return self.load_loss_history()[0]
+
+    def load_loss_history(self):
+        """(losses, {step: val_loss}). Reads the pre-val_loss 2-column format too."""
         path = self.path("losses.csv")
         if not path.exists():
-            return []
+            return [], {}
 
         with open(path, newline="", encoding="utf-8") as f:
-            rows = list(csv.reader(f))
-        return [float(loss) for _, loss in rows[1:]]
+            rows = list(csv.reader(f))[1:]
 
-    def save_loss_curve(self, losses, k=100):
-        plot_losses(losses, k, title=f"{self.name} — training loss", path=self.path("loss.png"))
+        losses, val_losses = [], {}
+        for row in rows:
+            losses.append(float(row[1]))
+            if len(row) > 2 and row[2] != "":
+                val_losses[int(row[0])] = float(row[2])
+        return losses, val_losses
+
+    def save_loss_curve(self, losses, k=100, val_losses=None):
+        plot_losses(losses, k, title=f"{self.name} — training loss",
+                    path=self.path("loss.png"), val_losses=val_losses)
         return self.path("loss.png")
 
     def save_grid(self, images, filename, ncols=8):
@@ -251,7 +297,8 @@ def comparison_table(metrics_by_run, keys=None, digits=3):
     keys = keys or [
         "fid", "kid_mean", "cmmd", "precision", "recall",
         "clip_score", "clip_accuracy", "clip_accuracy_real",
-        "nn_similarity_mean", "diversity_fake", "diversity_real",
+        "nn_similarity_mean", "lpips_nn_mean", "perceptual_copy_rate",
+        "pixel_nn_rmse_mean", "diversity_fake", "diversity_real",
     ]
     runs = list(metrics_by_run)
     width = max([len(k) for k in keys] + [6])
@@ -274,7 +321,22 @@ if __name__ == "__main__":
         run = Run("smoke", root=tmp, config={"steps": 10, "note": "self-test"})
         images = torch.randn(8, 3, 64, 64).clamp(-1, 1)
 
-        run.save_losses([1.0, 0.5, 0.25])
+        run.save_losses([1.0, 0.5, 0.25], {2: 0.6})
+        losses, val_losses = run.load_loss_history()
+        assert losses == [1.0, 0.5, 0.25], losses
+        assert val_losses == {2: 0.6}, val_losses
+
+        # Incremental appends must round-trip through the same reader.
+        run2 = Run("smoke_append", root=tmp)
+        run2.append_losses([(1, 1.0, None), (2, 0.5, 0.6)])
+        run2.append_losses([(3, 0.25, None)])
+        assert run2.load_loss_history() == ([1.0, 0.5, 0.25], {2: 0.6})
+
+        # The pre-val_loss two-column format still reads.
+        with open(run2.path("losses.csv"), "w", encoding="utf-8") as f:
+            f.write("step,loss\n1,1.0\n2,0.5\n")
+        assert run2.load_loss_history() == ([1.0, 0.5], {})
+
         run.save_grid(images, "grid.png", ncols=4)
         run.save_metrics({"fid": 12.5, "clip_accuracy": 0.75})
 

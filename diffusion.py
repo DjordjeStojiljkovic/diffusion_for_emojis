@@ -62,10 +62,18 @@ class Diffusion:
         acp = self.alphas_cumprod[t].view(-1, 1, 1, 1)
         return acp.sqrt() * x0 + (1 - acp).sqrt() * noise
 
-    def loss(self, model, x0, y=None):
-        """MSE between the noise we added and the noise the model predicts."""
-        t = torch.randint(0, self.timesteps, (x0.shape[0],), device=x0.device)
-        noise = torch.randn_like(x0)
+    def loss(self, model, x0, y=None, t=None, noise=None):
+        """MSE between the noise we added and the noise the model predicts.
+
+        `t` and `noise` are drawn fresh per call during training. Pass them
+        explicitly to make the loss deterministic: the validation loss has to
+        hold them fixed across evaluations, or the curve measures which
+        timesteps were sampled rather than how the model improved.
+        """
+        if t is None:
+            t = torch.randint(0, self.timesteps, (x0.shape[0],), device=x0.device)
+        if noise is None:
+            noise = torch.randn_like(x0)
         return F.mse_loss(_eps(model, self.q_sample(x0, t, noise), t, y), noise)
 
     @torch.no_grad()

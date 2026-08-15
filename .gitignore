@@ -1,3 +1,11 @@
 __pycache__/
+.ipynb_checkpoints/
 
 datasets/
+runs/
+models/
+results/
+
+# Checkpoints are large (~126 MB each). The figures, losses.csv and
+# metrics.json next to them are the results worth keeping in git.
+*.pt
